@@ -32,4 +32,4 @@ services:
       - key: ENABLE_GDELT
         value: '0'
       - key: OPENAI_MODEL
-        value: gpt-4.1-mini
+        value: gpt-6.2-astra
