@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: narrative-os-private
+    runtime: python
+    plan: starter
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /health
+    numInstances: 1
+    disk:
+      name: narrative-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: CLOUD_MODE
+        value: '1'
+      - key: NARRATIVE_DB
+        value: /var/data/narrative.db
+      - key: NARRATIVE_AUTH_DIR
+        value: /var/data/auth
+      - key: APP_PASSWORD
+        sync: false
+      - key: APP_SESSION_SECRET
+        generateValue: true
+      - key: ENABLE_REMOTE_MARKET
+        value: '0'
+      - key: DISABLE_POLLING
+        value: '1'
+      - key: ENABLE_GDELT
+        value: '0'
+      - key: OPENAI_MODEL
+        value: gpt-4.1-mini
