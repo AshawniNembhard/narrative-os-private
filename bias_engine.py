@@ -178,7 +178,7 @@ def evaluate(assessment,events,previous=None,now=None,focus='OANDA:XAUUSD',horiz
         support=sum(x['points'] for x in ledger)
         verified_release=any(r['verified'] for r in ledger)
         qualifies=_independent(ledger)
-        if basis in ('cross-market-inference','user-hypothesis') and abs(lead_support)>=MIN_ADOPT:
+        if basis in ('cross-market-inference','user-hypothesis','ai-hypothesis') and abs(lead_support)>=MIN_ADOPT:
             macro_direction='Bullish' if lead_support>0 else 'Bearish'
             switched=macro_direction!=direction
             direction=macro_direction
@@ -203,7 +203,7 @@ def evaluate(assessment,events,previous=None,now=None,focus='OANDA:XAUUSD',horiz
             reason=('Opposing macro evidence has emerged, but reversal requirements are unmet. '
                    'Maintain the previous bias while checking causal materiality and independent corroboration.')
         else:
-            state='provisional-held' if basis=='cross-market-inference' else 'retained'
+            state='provisional-held' if basis in ('cross-market-inference','ai-hypothesis') else 'retained'
             reason=('The macro thesis is retained; no qualifying new opposing evidence has invalidated it. '
                     'Missing CSVs, fresh market volatility and repeated scans do not reset the bias.')
         if price['direction'] not in ('Mixed',direction):
@@ -256,4 +256,29 @@ def adopt_user_thesis(assessment,events,previous,direction,rationale,now=None,fo
     base['switch_requirements']=['User-seeded hypothesis; requires source-dated macro evidence for promotion or a justified reversal.']
     base['history']=(list(old.get('history') or [])+[{'at':now.isoformat(),'direction':direction,
       'state':'provisional-user','reason':'Explicit user adoption: '+rationale.strip()}])[-30:]
+    return base
+
+
+def propose_ai_thesis(assessment,events,previous,direction,rationale,now=None,focus='OANDA:XAUUSD',horizon='intraday'):
+    """One-time AI-proposed working bias. Never overwrite an already held thesis.
+
+    An explanation is not evidence of buying/selling or a qualified bias switch.
+    """
+    if previous and previous.get('direction') in ('Bullish','Bearish'):
+        return previous
+    if direction not in ('Bullish','Bearish') or not isinstance(rationale,str) or len(rationale.strip())<12:
+        return previous
+    now=now or datetime.now(UTC)
+    base=evaluate(assessment,events,previous,now,focus=focus,horizon=horizon)
+    if base.get('basis')=='macro-evidence':
+        return base
+    reason=('AI-proposed, unverified working thesis: '+rationale.strip()[:500]+
+            ' Headlines and price divergence alone do not verify the mechanism.')
+    base.update({'direction':direction,'state':'provisional-ai','basis':'ai-hypothesis',
+        'reason':reason,'established_at':now.isoformat(),'last_change_at':now.isoformat(),
+        'challenger_evidence':[],'challenger_points':0.,'basis_evidence':[],
+        'ai_rationale':rationale.strip()[:500],'switched':False})
+    base['switch_requirements']=['AI hypothesis is speculative. Require distinct source-dated macro evidence for promotion or reversal.']
+    base['history']=(list(base.get('history') or [])+[{'at':now.isoformat(),
+        'direction':direction,'state':'provisional-ai','reason':reason}])[-30:]
     return base

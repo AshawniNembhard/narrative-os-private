@@ -56,3 +56,15 @@ To simulate the private cloud service locally in a development environment, set 
 ## Current verification status
 
 Code and API checks are automated, but external deployment still needs your GitHub/Render authorisation and a live HTTPS acceptance test. An actual TradingView CSV and live AI sign-in have not been tested end-to-end on a production-hosted instance. See `README-v06-local.md` for the original model/research design.
+
+## v0.7 — Unified Research Studio (on demand)
+
+Narrative OS now has an **on-demand Research Studio** on the sidebar and an entry point on Overview:
+
+1. **Discover**: enter a research mandate, select a ticker/horizon, optionally run a targeted headline scan, and request AI discovery. AI must propose multiple *unconventional cross-disciplinary* causal mechanisms, one provisional priority and serious challengers, with observable earliest signals, missing external evidence and falsifiers. The original headline text/URLs are source metadata, **not proof of the proposed claims**.
+2. **Commit to a provisional thesis**: if no prior directional bias exists, a valid AI discovery can seed an explicitly **AI-proposed, unverified** bullish or bearish working bias. It does **not** overwrite a held user or evidence-based bias; headlines, price noise and repeated identical CSVs cannot flip an established fundamental position.
+3. **Request and upload chart data**: AI chooses 2–6 cross-market instruments from a validation catalog; download TradingView CSVs manually in the requested timeframes and upload each. External non-price measurements remain separately required. Do not upload passwords or account credentials.
+4. **Analyse uploaded markets**: the app aligns completed candle timestamps and computes descriptive cross-market results. The user can request AI synthesis and a qualitative **theory horse race**. The race may re-rank candidate explanations using the actual uploaded context, but cannot by itself reverse the retained fundamental bias.
+5. **Refresh evidence and reassess**: one explicit button performs a new targeted news search, revises evidence scores and the held/challenged/switch bias state, and optionally runs AI synthesis when the required CSVs are ready. Every action is user-triggered; the app does **not** poll 100s of tickers or continuously call the AI.
+
+This workflow is a **single controlled council synthesis**, not hundreds of independently simulated agents. AI priorities and qualitative points are not calibrated probabilities, confirmed physical-market mechanisms, guaranteed causal findings, or trade signals. If there are no verifiable source or price observations, the dashboard keeps the distinction between a tentative idea and a verified fundamental development. Research data stays on the existing persistent disk; the upgrade only adds optional JSON fields to council plan/run records and does not migrate or reset earlier data.

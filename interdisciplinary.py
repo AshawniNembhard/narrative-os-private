@@ -12,6 +12,7 @@ import re
 import statistics
 
 UTC=timezone.utc
+DAILY_ONLY={'real','tips5','breakeven'}
 
 CATALOG={
  'gold':('OANDA:XAUUSD','Gold spot','Outcome asset and benchmark'),
@@ -25,6 +26,12 @@ CATALOG={
  'futures':('COMEX:GC1!','Gold futures (continuous)','Gold futures-versus-spot relationship; rollover caution'),
  'credit':('AMEX:HYG','High-yield bond ETF price','Risk/credit proxy; NOT an actual credit-spread series'),
  'gbpjpy':('OANDA:GBPJPY','GBP/JPY','FX cross-asset response for sterling and yen'),
+ 'brent':('ICEEUR:BRN1!','Brent crude continuous','Global seaborne oil; continuous-contract roll adjustments matter'),
+ 'vix':('CBOE:VIX','US equity volatility index','Equity options-implied volatility; not a direct haven-funding flow'),
+ 'breakeven':('FRED:T5YIE','5-year US inflation breakeven','Daily inflation compensation; not an intraday inflation expectation'),
+ 'tips5':('FRED:DFII5','5-year US TIPS real yield','Daily shorter-horizon real-yield comparison'),
+ 'short_rate':('CME:SR31!','SOFR 3-month futures continuous','Price is 100 minus an implied rate; roll dates matter'),
+ 'yen':('OANDA:USDJPY','USD/JPY','Currency-funding and global risk proxy; avoid equating FX with flows'),
 }
 MECHANISMS={
  'freight':{'name':'Shipping/insurance → energy → inflation/rates → gold','words':r'freight|marine|shipping|insur|suez|red sea|tanker|port|cargo|strait|shipping route|logistic',
@@ -89,8 +96,8 @@ def plan(question,focus='OANDA:XAUUSD',horizon='intraday',headlines=None):
         if len(assets)>=7:break
         # Daily series are contextual for intraday/swing; cannot calculate
         # same-clock returns against 1h/4h candles.
-        series_interval='1D' if key=='real' else main_interval
-        tier='context' if key=='real' and main_interval!='1D' else ('required' if len([a for a in assets if a['priority']=='required'])<4 else 'optional')
+        series_interval='1D' if key in DAILY_ONLY else main_interval
+        tier='context' if key in DAILY_ONLY and main_interval!='1D' else ('required' if len([a for a in assets if a['priority']=='required'])<4 else 'optional')
         assets.append({'key':key,'symbol':symbol,'name':name,'interval':series_interval,
                        'priority':tier,'reason':role,'data_class':'observed_chart'})
         taken.add(symbol)
@@ -264,7 +271,7 @@ def refine_plan(base, ai_selection):
     for k in clean[:6]:
         symbol,name,reason=CATALOG[k]
         if symbol==base['focus']:continue
-        iv='1D' if k=='real' else main_interval
+        iv='1D' if k in DAILY_ONLY else main_interval
         req.append({'key':k,'symbol':symbol,'name':name,'interval':iv,
                     'priority':'context' if iv!=main_interval else 'required' if len([r for r in req if r['priority']=='required'])<4 else 'optional',
                     'reason':reason,'data_class':'observed_chart'})

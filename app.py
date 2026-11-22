@@ -23,6 +23,7 @@ import web_scan
 import scoring
 import market_csv
 import interdisciplinary
+import research_cycle
 import bias_engine
 import cloud_security
 import cloud_ai
@@ -35,7 +36,7 @@ from pydantic import BaseModel, Field
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv('NARRATIVE_DB', str(ROOT/'narrative.db')))
 UTC = dt.timezone.utc
-app = FastAPI(title='Narrative OS', version='0.6.1-cloud')
+app = FastAPI(title='Narrative OS', version='0.7.0-cloud')
 cloud_security.validate_config()
 
 @app.middleware('http')
@@ -44,7 +45,7 @@ async def private_cloud_gate(request:Request, call_next):
 
 @app.get('/health')
 def health():
-    return {'status':'ok','version':'0.6.1-cloud'}
+    return {'status':'ok','version':'0.7.0-cloud'}
 
 @app.get('/login')
 def login_get():
@@ -547,9 +548,11 @@ class CouncilPlanInput(BaseModel):
     focus:str='OANDA:XAUUSD'
     horizon:str='intraday'
     ai_refine:bool=False
+    discover_news:bool=False
 
 class CouncilRunInput(BaseModel):
     ai_synthesis:bool=False
+    refresh_evidence:bool=False
 
 class CouncilAdoptBiasInput(BaseModel):
     direction:Literal['Bullish','Bearish']
@@ -578,7 +581,9 @@ def _apply_bias(report,bias):
     direction=bias.get('direction') if bias else 'Unestablished'
     market=report.get('price_support') or {}
     if direction in ('Bullish','Bearish'):
-        tag=('Provisional cross-market working bias' if bias.get('basis')=='cross-market-inference'
+        tag=('AI-proposed unverified working bias' if bias.get('basis')=='ai-hypothesis'
+             else 'Provisional cross-market working bias' if bias.get('basis')=='cross-market-inference'
+             else 'User-proposed working bias' if bias.get('basis')=='user-hypothesis'
              else 'Fundamental research bias')
         report['leading_observation']=(f'{tag}: {direction} · {bias.get("state","retained")} — '
               'fast price moves are diagnostic, not automatic reversals')
@@ -618,35 +623,83 @@ def _council_current():
 @app.get('/api/council/current')
 def council_current():return _council_current()
 
+def _targeted_council_scan(question):
+    """A single user-triggered headline discovery. Failure is nonfatal and visible."""
+    try:
+        results=search_on_demand(ResearchPrompt(question=question.strip()[:450]))
+        return {'status':'scanned','new_items':results.get('new',0),
+                'sources':research_cycle.capture_headlines(results.get('results',[])),
+                'at':utc_now(),'scope':'headline metadata only; not full articles or verified causal events'}
+    except Exception as ex:
+        return {'status':'unavailable','new_items':0,'sources':[],
+                'error':str(getattr(ex,'detail',ex))[:190],'at':utc_now()}
+
+
 @app.post('/api/council/plan')
 def create_council_plan(body:CouncilPlanInput):
+    # Step 1: discover news only when the user explicitly requests it.
+    discovery_scan=(_targeted_council_scan(body.question) if body.discover_news
+                    else {'status':'not requested','sources':[],'new_items':0,'at':utc_now()})
     events=sorted(list_events('live')+list_events('manual'),key=lambda e:e.get('time',''))
     try:record=interdisciplinary.plan(body.question,body.focus,body.horizon,events[-25:])
     except ValueError as e:raise HTTPException(422,str(e))
+    record['discovery_scan']=discovery_scan
+    record['research_cycle']=research_cycle.no_ai_discovery()
     if body.ai_refine:
         if not chatgpt_auth.status().get('sharing') and not cloud_ai.configured():
-            record['ai_note']='AI planning unavailable without an authorised AI account; rule-based proposal shown.'
+            record['ai_note']='AI discovery unavailable without an authorised AI account; rule-based request list shown.'
         else:
             try:
-                payload={'question':body.question,'horizon':body.horizon,
+                payload={'question':body.question,'horizon':body.horizon,'focus':body.focus,
                    'catalog':[{'key':k,'symbol':v[0],'use':v[2]} for k,v in interdisciplinary.CATALOG.items()],
-                   'news_titles':[e.get('title','') for e in events[-12:]],
+                   'headline_metadata':discovery_scan.get('sources',[]),
+                   'dated_evidence':[{'title':e.get('title'),'time':e.get('time'),
+                        'kind':e.get('source_kind'),'impacts':e.get('impacts'),
+                        'source':e.get('source')} for e in events[-18:]],
+                   'existing_held_bias':_load_bias(record['focus'],record['horizon']),
                    'baseline_proposal':record}
-                instructions=('You are a skeptical cross-disciplinary macro researcher. Propose only tickers from the supplied catalog. '
-                   'Look for unconventional but testable causal chains, avoid asserting causation from correlation. '
-                   'Return JSON with selected_keys (2-6 catalog keys), rationale (string), hypothesis (string), and novel_link: {chain, evidence_needed, falsifier} describing an unverified unconventional hypothesis. '
-                   'Choose an informative minimal dataset, not every ticker. Do not give trades or probabilities.')
-                if chatgpt_auth.status().get('sharing'):
-                    selection=chatgpt_auth.infer_json(instructions,payload)
-                else:
-                    selection=cloud_ai.infer_json(instructions,payload)
-                record=interdisciplinary.refine_plan(record,selection)
+                instructions=('You are a council of interdisciplinary economic investigators. Seek genuinely unconventional, '
+                   'testable cross-domain causal chains connecting seemingly unrelated industries, finance, physical flows '
+                   'and monetary transmission to the focal asset. Avoid ordinary one-hop macro commentary. '
+                   'Return JSON with selected_keys (2-6 keys from catalog), rationale (string), hypothesis (string), '
+                   'novel_link object with chain, evidence_needed, falsifier, '
+                   'theories (2-4 objects each with title, direction Bullish/Bearish/Two-sided, chain, falsifier, '
+                   'external_evidence, earliest_indicator, horizon), leading_index (zero-based index into theories), '
+                   'leading_reason (string), why_unconventional (string), cannot_conclude (string). '
+                   'Prioritize a directional *working* theory if defensible, before every piece of evidence is published, '
+                   'but never fabricate observations or claim that speculation is proof. Include serious opposing theories. '
+                   'Each causal chain must cross at least two distinct disciplines and specify a measurable transmission path. '
+                   'Headline metadata is unverified, not full article text; do not invent citations, figures, events or flow data. '
+                   'Explain what specific data could make the leading thesis lose its position. '
+                   'The existing held bias is persistent: never imply that this fresh brainstorm automatically reverses it. '
+                   'Choose the smallest informative ticker basket; no price targets, trades or made-up probabilities.')
+                selection=(chatgpt_auth.infer_json(instructions,payload) if chatgpt_auth.status().get('sharing')
+                           else cloud_ai.infer_json(instructions,payload))
+                # Separate validations prevent an incomplete AI output from masking useful parts.
+                record['research_cycle']=research_cycle.normalise_discovery(selection)
+                try:record=interdisciplinary.refine_plan(record,selection)
+                except (ValueError,TypeError) as ex:
+                    record['ai_note']='AI discovered hypotheses; deterministic ticker basket retained: '+str(ex)[:135]
             except Exception as ex:
-                record['ai_note']='AI planning unsuccessful; validated deterministic proposal shown: '+str(ex)[:160]
+                record['ai_note']='AI discovery unsuccessful; validated rule-based planner retained: '+str(ex)[:160]
     record['created_at']=utc_now();record['id']='plan-'+uuid.uuid4().hex[:14]
     with DB_LOCK,conn() as c:
         c.execute('INSERT INTO council_plans(id,created,payload) VALUES(?,?,?)',
                   (record['id'],record['created_at'],json.dumps(record,ensure_ascii=False)))
+    # The AI can seed a *labelled provisional thesis* once, but never replace an
+    # established or previously held bias through a repeated discovery request.
+    cycle=record['research_cycle']
+    if cycle['leading_direction'] in ('Bullish','Bearish'):
+        current=_council_current()
+        prior=_load_bias(record['focus'],record['horizon'])
+        proposed=bias_engine.propose_ai_thesis(current['assessment'],events,prior,
+                cycle['leading_direction'],cycle['leading_reason'],
+                focus=record['focus'],horizon=record['horizon'])
+        if proposed and proposed!=prior:
+            with DB_LOCK,conn() as c:
+                c.execute('INSERT INTO council_bias_states(focus,horizon,updated,payload) VALUES(?,?,?,?) '
+                    'ON CONFLICT(focus,horizon) DO UPDATE SET updated=excluded.updated,payload=excluded.payload',
+                    (record['focus'],record['horizon'],utc_now(),json.dumps(proposed,ensure_ascii=False)))
     return _council_current()
 
 @app.post('/api/council/bias/adopt')
@@ -666,10 +719,15 @@ def council_adopt_bias(body:CouncilAdoptBiasInput):
 
 @app.post('/api/council/run')
 def run_council(body:CouncilRunInput):
+    # Refresh once on demand. This is NOT a background price-scraping loop.
+    old_plan=_council_current().get('plan')
+    discovery_scan=(_targeted_council_scan(old_plan['question'])
+                    if old_plan and body.refresh_evidence else None)
     cur=_council_current()
     plan=cur['plan']
     if not plan:raise HTTPException(409,'Create a ticker request plan first.')
     assessment=cur['assessment'];run_id='run-'+uuid.uuid4().hex[:14]
+    if discovery_scan:assessment['discovery_scan']=discovery_scan
     events=sorted(list_events('live')+list_events('manual'),key=lambda e:e.get('time',''))
     with DB_LOCK,conn() as c:
         previous=_load_bias(plan['focus'],plan['horizon'])
@@ -678,6 +736,7 @@ def run_council(body:CouncilRunInput):
             'ON CONFLICT(focus,horizon) DO UPDATE SET updated=excluded.updated,payload=excluded.payload',
             (plan['focus'],plan['horizon'],utc_now(),json.dumps(current_bias,ensure_ascii=False)))
     _apply_bias(assessment,current_bias)
+    assessment['theory_horse_race']=research_cycle.initial_horse_race(plan.get('research_cycle',{}))
     if body.ai_synthesis:
         if assessment['status']!='ready-for-synthesis':
             assessment['ai_note']='AI synthesis blocked until required chart CSVs are uploaded, fresh and aligned.'
@@ -687,18 +746,24 @@ def run_council(body:CouncilRunInput):
             try:
                 instructions=('Act as a cross-disciplinary economic research council. Do not invent source facts, data, financial flows, timestamps or returns. '
                   'Use only the submitted figures and cited news; carefully separate observed correlations from hypothetical mechanisms. '
+                  'Re-evaluate the original competing interdisciplinary theories against observed evidence, rank a leading case and credible challengers. '
                   'Offer conditional bullish/bearish/flat scenarios and testable falsifiers; no trade recommendations or numeric probabilities. '
                   'Respect the held fundamental_bias state; a different price-led scenario is a challenge, not an automatic regime switch. '
                   'If physical-gold or non-price evidence is absent, say so and do not claim it is confirmed. '
-                  'Return JSON keys: synthesis, leading_scenario, causal_chains, counterarguments, missing_evidence, invalidations, uncertainty. '
+                  'Return JSON keys: synthesis, leading_scenario, causal_chains, counterarguments, missing_evidence, invalidations, uncertainty, theory_rankings. '
+                  'theory_rankings must be a list ordered from strongest to weakest *provisional* explanation. Each item contains id (from supplied theories), why_ranked, and status (price-context supports / price-context challenges / unverified / awaiting external checks). '
+                  'A chart divergence can reorder a speculative race but cannot prove causation or automatically reverse held fundamental bias. '
                   'All values should be strings except causal_chains, counterarguments, missing_evidence, invalidations, which must be arrays of strings.')
                 payload={'plan':plan,'measurement_summary':{k:v for k,v in assessment.items() if k not in ('requests','mechanisms')},
+                    'discovered_competing_theories':plan.get('research_cycle',{}),
+                    'source_metadata':plan.get('discovery_scan',{}),
                     'upload_status':assessment['requests']}
                 answer=(chatgpt_auth.infer_json(instructions,payload) if chatgpt_auth.status().get('sharing')
                         else cloud_ai.infer_json(instructions,payload))
                 fields=('synthesis','leading_scenario','causal_chains','counterarguments','missing_evidence','invalidations','uncertainty')
                 if not all(k in answer for k in fields):raise ValueError('Incomplete AI answer')
                 assessment['ai_synthesis']={k:answer[k] for k in fields}
+                assessment['theory_horse_race']=research_cycle.revise_horse_race(plan.get('research_cycle',{}),answer)
                 assessment['method']='validated CSV calculations + explicitly requested AI narrative synthesis'
             except Exception as ex:assessment['ai_note']='AI synthesis failed; calculation-only report retained: '+str(ex)[:160]
     assessment.update({'run_id':run_id,'plan_id':plan['id']})
