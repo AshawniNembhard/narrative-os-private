@@ -1,0 +1,14 @@
+NARRATIVE OS PRIVATE CLOUD — DEPLOY CHECKLIST
+
+1. Unzip on Windows/Mac.
+2. Create PRIVATE GitHub repo, publish the extracted files (render.yaml at repo root).
+3. Visit https://dashboard.render.com — New > Blueprint — connect your repo.
+4. Confirm paid Starter web instance plus 1 GB persistent disk.
+5. Enter a UNIQUE strong APP_PASSWORD when Render asks; leave the generated session secret intact.
+6. Deploy; open your HTTPS .onrender.com URL; sign in with APP_PASSWORD.
+7. On iPhone Safari: Share > Add to Home Screen.
+8. Data sources: import old narrative.db if you want previous saved research.
+9. Optional: in Render Environment, add OPENAI_API_KEY (separate billed API; not ChatGPT Plus).
+10. In the app: Council > request ticker basket > upload TradingView CSVs > Re-run.
+
+NOT LIVE YET: This ZIP is deployment-ready, not deployed. Your GitHub/Render permissions are needed to publish it.
