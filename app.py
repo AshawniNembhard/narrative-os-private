@@ -28,6 +28,7 @@ import bias_engine
 import cloud_security
 import cloud_ai
 import cloud_migration
+import window_forecasts
 import uuid
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -36,7 +37,7 @@ from pydantic import BaseModel, Field
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv('NARRATIVE_DB', str(ROOT/'narrative.db')))
 UTC = dt.timezone.utc
-app = FastAPI(title='Narrative OS', version='0.7.0-cloud')
+app = FastAPI(title='Narrative OS', version='0.8.0-cloud')
 cloud_security.validate_config()
 
 @app.middleware('http')
@@ -45,7 +46,7 @@ async def private_cloud_gate(request:Request, call_next):
 
 @app.get('/health')
 def health():
-    return {'status':'ok','version':'0.7.0-cloud'}
+    return {'status':'ok','version':'0.8.0-cloud'}
 
 @app.get('/login')
 def login_get():
@@ -113,6 +114,7 @@ def initialize():
         c.execute('CREATE TABLE IF NOT EXISTS council_plans (id TEXT PRIMARY KEY, created TEXT NOT NULL, payload TEXT NOT NULL)')
         c.execute('CREATE TABLE IF NOT EXISTS council_runs (id TEXT PRIMARY KEY, plan_id TEXT NOT NULL, created TEXT NOT NULL, payload TEXT NOT NULL)')
         c.execute('CREATE TABLE IF NOT EXISTS council_bias_states (focus TEXT NOT NULL, horizon TEXT NOT NULL, updated TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(focus,horizon))')
+        window_forecasts.init_db(c)
         n=c.execute("SELECT COUNT(*) AS n FROM events WHERE mode='demo'").fetchone()['n']
         if n==0:
             for e in DEMO[:3]: save_event(c,e,'demo')
@@ -536,6 +538,12 @@ async def import_chart(request:Request, symbol:str=Query(...), interval:str=Quer
         c.execute('DELETE FROM chart_imports WHERE symbol=? AND interval=? AND id NOT IN '
                   '(SELECT id FROM chart_imports WHERE symbol=? AND interval=? ORDER BY id DESC LIMIT 3)',
                   (record['symbol'],record['interval'],record['symbol'],record['interval']))
+        # Grade previously locked windows deterministically when a fresh CSV arrives.
+        # Never score from the AI's text, and never backdate a missing forecast.
+        rows=c.execute('SELECT payload FROM window_forecasts WHERE instrument=? AND closes<=?',
+                       (record['symbol'],utc_now())).fetchall()
+        candidates=[json.loads(row['payload']) for row in rows]
+        window_forecasts.audit_pending(c,candidates,[{**record,'uploaded_at':utc_now()}])
     result=market_csv.public_view(record)
     result['uploaded_at']=utc_now()
     return result
@@ -770,6 +778,188 @@ def run_council(body:CouncilRunInput):
     with DB_LOCK,conn() as c:c.execute('INSERT INTO council_runs(id,plan_id,created,payload) VALUES(?,?,?,?)',
                (run_id,plan['id'],utc_now(),json.dumps(assessment,ensure_ascii=False)))
     return {'plan':plan,'report':assessment}
+
+# Four independent forecast windows / deterministic adjudication (v0.8).
+WINDOW_FOCUS='OANDA:XAUUSD'
+WINDOW_FORECAST_LOCK=threading.RLock()
+
+class WindowGenerateInput(BaseModel):
+    date:str|None=None
+
+class WindowAutoInput(BaseModel):
+    enabled:bool
+
+
+def _window_records(days=100):
+    start=(dt.datetime.now(UTC)-dt.timedelta(days=days)).date().isoformat()
+    with DB_LOCK,conn() as c:
+        rows=c.execute('SELECT payload FROM window_forecasts WHERE trading_date>=? AND instrument=? '
+                       'ORDER BY trading_date DESC,window_id',(start,WINDOW_FOCUS)).fetchall()
+        records=[json.loads(row['payload']) for row in rows]
+        return records,window_forecasts.latest_audits(c,records)
+
+
+def _window_facts(now):
+    current=_council_current()
+    plan=current.get('plan') or {}
+    bias=current.get('held_bias') or _load_bias(WINDOW_FOCUS,'intraday') or {}
+    # A previous research cycle is context, never independently corroborated evidence.
+    prior=plan.get('research_cycle') or {}
+    observations=[]
+    for c in recent_charts(max_rows=20):
+        if c.get('symbol') in (WINDOW_FOCUS,'TVC:DXY','COMEX:GC1!','FRED:DFII10'):
+            observations.append({k:c.get(k) for k in ('symbol','interval','last_time','latest_close',
+                        'twenty_bar_percent','one_bar_percent','uploaded_at','cautions')})
+    items=[e for e in list_events('live')+list_events('manual') if parse_date(e.get('time'))<=now]
+    items.sort(key=lambda e:e.get('time',''),reverse=True)
+    return {'as_of_utc':window_forecasts.iso(now),'focus':WINDOW_FOCUS,
+      'held_fundamental_bias':{k:bias.get(k) for k in ('direction','state','basis','reason','ai_rationale')},
+      'research_mandate':str(plan.get('question') or '')[:900],
+      'current_ai_priority':{k:prior.get(k) for k in ('leading_title','leading_direction','leading_reason','theories')},
+      'market_snapshots':observations[:8],
+      'dated_evidence':[{'title':e.get('title'),'time':e.get('time'),'source':e.get('source'),
+          'source_kind':e.get('source_kind')} for e in items[:10]],
+      'limitations':'Market snapshots are manually uploaded and potentially stale. '
+          'No independent continuous market feed. Headline metadata is not proof.'}
+
+
+def _window_generation(day=None,now=None):
+    """Generate future-only predictions. Repeated calls never replace a locked forecast."""
+    now=now or dt.datetime.now(UTC)
+    target=window_forecasts.validate_date(day,now)
+    with WINDOW_FORECAST_LOCK:
+        with DB_LOCK,conn() as c:
+            existing=window_forecasts.rows_for_day(c,target.isoformat(),WINDOW_FOCUS)
+        slots=window_forecasts.prepared_slots(target,now,existing)
+        if not slots:raise ValueError('No eligible future windows remain on this date. Existing forecasts are locked.')
+        if not cloud_ai.configured() and not chatgpt_auth.status().get('sharing'):
+            raise ValueError('An OpenAI connection is required to generate council forecasts.')
+        context=_window_facts(now)
+        instructions=('You are a forward-looking interdisciplinary gold research council. Forecast EACH supplied two-hour '
+          'London-time window on its own merits; do not simply copy the held macro bias. '
+          'Give a Bullish, Bearish, Flat, or Abstain forecast for each. '
+          'Bullish means XAUUSD rises >0.10% open-to-close during that exact window; Bearish means falls >0.10%; '
+          'Flat means absolute move <=0.10%; Abstain means there is insufficient edge. '
+          'These thresholds are fixed by a separate deterministic auditor. '
+          'Assess plausible price and catalyst timing, competing explanations, liquidity and sessions, '
+          'but never fabricate live prices, current news or verified market flows. '
+          'A stale input is stale, and an unverified thesis stays unverified. '
+          'You can predict a bearish window while the macro bias is bullish. '
+          'Choose Abstain when no non-arbitrary directional or flat expectation can be defended. '
+          'Do not claim calibrated probabilities. Return ONLY a JSON object with forecasts array, '
+          'exactly one forecast for each supplied window_id; each forecast must include '
+          'window_id (integer), direction (Bullish/Bearish/Flat/Abstain), rationale, catalyst, '
+          'invalidation, leading_theory, alternative and conviction (qualitative, not numeric). '
+          'These are experimental forecasts, not orders or investment advice.')
+        payload={'windows_to_forecast':[{'window_id':slot['id'],'label':slot['label'],
+                   'opens_at':slot['opens_at'],'closes_at':slot['closes_at']} for slot in slots],
+                 'research_context':context}
+        answer=(chatgpt_auth.infer_json(instructions,payload) if chatgpt_auth.status().get('sharing')
+                else cloud_ai.infer_json(instructions,payload))
+        predictions=window_forecasts.normalize_batch(answer,slots)
+        with DB_LOCK,conn() as c:
+            # This transaction is atomic; clock is rechecked AFTER remote AI inference.
+            locked=window_forecasts.lock_forecasts(c,target.isoformat(),WINDOW_FOCUS,slots,
+                predictions,{'held_bias_at_lock':context['held_fundamental_bias'],
+                             'input_snapshot_as_of':context['as_of_utc'],
+                             'research_mandate':context['research_mandate'],
+                             'theory_at_lock':context['current_ai_priority'].get('leading_title'),
+                             'snapshot_times':[{'symbol':v['symbol'],'last_time':v['last_time']} for v in context['market_snapshots']]},
+                dt.datetime.now(UTC))
+        return locked
+
+@app.post('/api/windows/forecast')
+def window_generate(body:WindowGenerateInput):
+    try:locked=_window_generation(body.date)
+    except (ValueError,TypeError) as e:raise HTTPException(409,str(e))
+    except Exception as e:raise HTTPException(502,'Window forecasting failed: '+str(e)[:150])
+    return {'locked':locked,'count':len(locked),'immutable':True,'not_trade_signals':True}
+
+@app.get('/api/windows')
+def windows_today(date:str|None=None):
+    try:
+        now=dt.datetime.now(UTC)
+        target=window_forecasts.validate_display_date(date,now)
+        with DB_LOCK,conn() as c:
+            forecasts=window_forecasts.rows_for_day(c,target.isoformat(),WINDOW_FOCUS)
+            audits=window_forecasts.latest_audits(c,forecasts)
+        board=window_forecasts.window_summary(forecasts,audits,target,now,WINDOW_FOCUS)
+        board['auto_enabled']=get_setting('auto_window_forecasts')
+        board['held_macro_bias']=_load_bias(WINDOW_FOCUS,'intraday')
+        return board
+    except ValueError as e:raise HTTPException(422,str(e))
+
+@app.post('/api/windows/audit')
+def windows_audit():
+    records=_raw_charts()
+    forecasts,_=_window_records(days=100)
+    with DB_LOCK,conn() as c:
+        audited=window_forecasts.audit_pending(c,forecasts,records)
+    return {'newly_graded':audited,'count':len(audited),
+            'source':'Manual TradingView CSV; deterministic rules, not verified exchange feeds'}
+
+@app.get('/api/windows/performance')
+def windows_performance(days:int=Query(90,ge=1,le=365)):
+    forecasts,audits=_window_records(days)
+    stats={}
+    for n,_,_,name in window_forecasts.WINDOWS:
+        relevant=[f for f in forecasts if f['window_id']==n]
+        scores=[audits.get(f['id']) for f in relevant if f['id'] in audits]
+        scored=[a for a in scores if a['grade'] in ('Win','Loss') and a.get('predicted_direction') in ('Bullish','Bearish')]
+        wins=sum(a['grade']=='Win' for a in scored)
+        stats[str(n)]={'label':name,'locked':len(relevant),'wins':wins,
+                       'losses':len(scored)-wins,
+                       'neutral':sum(a['grade']=='Neutral' for a in scores),
+                       'flat_wins':sum(a['grade']=='Win' and a.get('predicted_direction')=='Flat' for a in scores),
+                       'abstained':sum(a['grade']=='Abstained' for a in scores),
+                       'pending':len(relevant)-len(scores),
+                       'win_rate':round(100*wins/len(scored),1) if scored else None}
+    wins=sum(x['wins'] for x in stats.values());losses=sum(x['losses'] for x in stats.values())
+    return {'lookback_days':days,'by_window':stats,'total':{'locked':len(forecasts),
+        'wins':wins,'losses':losses,'win_rate':round(wins/(wins+losses)*100,1) if wins+losses else None},
+        'method':'Only pre-window forecasts; 10bp fixed dead zone; missing data stays pending',
+        'benchmark_status':'No independently licensed market-price feed or performance benchmark yet'}
+
+@app.post('/api/windows/auto')
+def windows_auto(body:WindowAutoInput):
+    if body.enabled and not cloud_ai.configured() and not chatgpt_auth.status().get('sharing'):
+        raise HTTPException(409,'Configure an AI connection before enabling paid automatic forecasts.')
+    set_setting('auto_window_forecasts',body.enabled)
+    return {'enabled':get_setting('auto_window_forecasts'),
+            'schedule':'00:30 Europe/London on weekdays; one paid AI call per day when opted in',
+            'warning':'Forecasts require an AI API call; judging requires imported CSV data.'}
+
+
+def _automatic_window_tick():
+    """One opportunistic daily launch from the single Render worker; no spend by default."""
+    if not get_setting('auto_window_forecasts'):return
+    now=dt.datetime.now(UTC);local=now.astimezone(window_forecasts.LONDON)
+    if local.weekday()>=5 or (local.hour,local.minute)<(0,30):return
+    day=local.date().isoformat()
+    with DB_LOCK,conn() as c:
+        claimed=c.execute('INSERT OR IGNORE INTO window_auto_attempts(trading_date,attempted_at,result) VALUES(?,?,?)',
+                (day,utc_now(),'attempted')).rowcount
+    if not claimed:return
+    try:_window_generation(day,now)
+    except Exception as ex:
+        # Do not retry endlessly and incur multiple charges; manual retry remains available.
+        with DB_LOCK,conn() as c:
+            c.execute('UPDATE window_auto_attempts SET result=? WHERE trading_date=?',(str(ex)[:200],day))
+
+_window_daemon_started=False
+@app.on_event('startup')
+def start_window_daemon():
+    global _window_daemon_started
+    if _window_daemon_started:return
+    _window_daemon_started=True
+    def run():
+        while True:
+            try:_automatic_window_tick()
+            except Exception:pass
+            time.sleep(60)
+    thread=threading.Thread(target=run,daemon=True,name='narrative-window-schedule')
+    thread.start()
+
 
 def latest_market():
     latest={}
