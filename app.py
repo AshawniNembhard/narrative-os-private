@@ -934,7 +934,9 @@ def _automatic_window_tick():
     """One opportunistic daily launch from the single Render worker; no spend by default."""
     if not get_setting('auto_window_forecasts'):return
     now=dt.datetime.now(UTC);local=now.astimezone(window_forecasts.LONDON)
-    if local.weekday()>=5 or (local.hour,local.minute)<(0,30):return
+    # Only schedule in the 00:30–00:59 London-time window. Enabling the
+    # setting at midday must NOT trigger an unexpected paid AI request.
+    if local.weekday()>=5 or local.hour!=0 or local.minute<30:return
     day=local.date().isoformat()
     with DB_LOCK,conn() as c:
         claimed=c.execute('INSERT OR IGNORE INTO window_auto_attempts(trading_date,attempted_at,result) VALUES(?,?,?)',
