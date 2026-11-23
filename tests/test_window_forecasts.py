@@ -132,7 +132,10 @@ def test_forecast_endpoint_and_paid_scheduler_off_by_default(tmp_path,monkeypatc
         board=client.get('/api/windows',params={'date':nextday.isoformat()}).json()
         assert board['auto_enabled'] is False
         assert len(board['windows'])==4
-        r=client.post('/api/windows/forecast',json={'date':nextday.isoformat()})
+        blocked=client.post('/api/windows/forecast',json={'date':nextday.isoformat()})
+        assert blocked.status_code==409
+        assert 'required CSV' in blocked.text or 'Required CSV' in blocked.text
+        r=client.post('/api/windows/forecast',json={'date':nextday.isoformat(),'allow_partial':True})
         assert r.status_code==200,r.text
         assert r.json()['count']==4
         assert client.post('/api/windows/forecast',json={'date':nextday.isoformat()}).status_code==409

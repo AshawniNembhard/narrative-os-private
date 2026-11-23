@@ -29,6 +29,7 @@ import cloud_security
 import cloud_ai
 import cloud_migration
 import window_forecasts
+import window_inputs
 import uuid
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -37,7 +38,7 @@ from pydantic import BaseModel, Field
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv('NARRATIVE_DB', str(ROOT/'narrative.db')))
 UTC = dt.timezone.utc
-app = FastAPI(title='Narrative OS', version='0.8.0-cloud')
+app = FastAPI(title='Narrative OS', version='0.9.0-cloud')
 cloud_security.validate_config()
 
 @app.middleware('http')
@@ -46,7 +47,7 @@ async def private_cloud_gate(request:Request, call_next):
 
 @app.get('/health')
 def health():
-    return {'status':'ok','version':'0.8.0-cloud'}
+    return {'status':'ok','version':'0.9.0-cloud'}
 
 @app.get('/login')
 def login_get():
@@ -115,6 +116,9 @@ def initialize():
         c.execute('CREATE TABLE IF NOT EXISTS council_runs (id TEXT PRIMARY KEY, plan_id TEXT NOT NULL, created TEXT NOT NULL, payload TEXT NOT NULL)')
         c.execute('CREATE TABLE IF NOT EXISTS council_bias_states (focus TEXT NOT NULL, horizon TEXT NOT NULL, updated TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(focus,horizon))')
         window_forecasts.init_db(c)
+        c.execute('CREATE TABLE IF NOT EXISTS window_ticker_plans ('
+                  'id TEXT PRIMARY KEY, source_plan_id TEXT NOT NULL, created TEXT NOT NULL, payload TEXT NOT NULL)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_window_ticker_plans ON window_ticker_plans(source_plan_id,created)')
         n=c.execute("SELECT COUNT(*) AS n FROM events WHERE mode='demo'").fetchone()['n']
         if n==0:
             for e in DEMO[:3]: save_event(c,e,'demo')
@@ -785,6 +789,7 @@ WINDOW_FORECAST_LOCK=threading.RLock()
 
 class WindowGenerateInput(BaseModel):
     date:str|None=None
+    allow_partial:bool=False
 
 class WindowAutoInput(BaseModel):
     enabled:bool
@@ -799,31 +804,105 @@ def _window_records(days=100):
         return records,window_forecasts.latest_audits(c,records)
 
 
-def _window_facts(now):
+def _window_requirements(now=None):
+    """Follow the current Research Studio AI basket, or the latest on-demand AI refresh.
+
+    If Research Studio creates a *new* plan, its newly requested basket supersedes
+    earlier window-only AI selections. No hidden automatic external AI calls.
+    """
+    now=now or dt.datetime.now(UTC)
     current=_council_current()
     plan=current.get('plan') or {}
-    bias=current.get('held_bias') or _load_bias(WINDOW_FOCUS,'intraday') or {}
-    # A previous research cycle is context, never independently corroborated evidence.
+    baseline=window_inputs.from_studio(plan,interdisciplinary.CATALOG,WINDOW_FOCUS)
+    plan_id=plan.get('id') if plan.get('focus')==WINDOW_FOCUS else None
+    with DB_LOCK,conn() as c:
+        row=c.execute('SELECT payload FROM window_ticker_plans WHERE source_plan_id=? '
+                      'ORDER BY created DESC,id DESC LIMIT 1',(plan_id or 'none',)).fetchone()
+    selected=json.loads(row['payload']) if row else baseline
+    readiness=window_inputs.status_for(selected['requests'],recent_charts(max_rows=100),now)
+    return {**selected,**readiness,'as_of_utc':window_forecasts.iso(now),
+            'source_plan_id':plan_id,'has_research_studio_plan':bool(plan_id)}
+
+
+@app.get('/api/windows/requirements')
+def windows_requirements():
+    return _window_requirements()
+
+
+@app.post('/api/windows/requirements/refresh')
+def windows_refresh_requirements():
+    """Explicitly billed, user-triggered AI selection; freeform ticker symbols rejected."""
+    if not cloud_ai.configured() and not chatgpt_auth.status().get('sharing'):
+        raise HTTPException(409,'An OpenAI connection is required to request a new ticker basket.')
+    now=dt.datetime.now(UTC)
+    prior=_window_requirements(now)
+    current=_council_current()
+    plan=current.get('plan') or {}
+    discovery=plan.get('research_cycle') or {}
+    payload={'focus':WINDOW_FOCUS,'research_mandate':str(plan.get('question') or '')[:900],
+             'leading_theory':{k:discovery.get(k) for k in ('leading_title','leading_direction','leading_reason','theories')},
+             'held_bias':_load_bias(WINDOW_FOCUS,'intraday'),
+             'currently_requested':[{k:r.get(k) for k in ('key','symbol','interval','priority','reason','status')}
+                                   for r in prior['requests']],
+             'available_snapshots':chart_context_for_ai(),
+             'catalog':[{'key':k,'symbol':v[0],'role':v[2]} for k,v in interdisciplinary.CATALOG.items()]}
+    instruction=('You are an interdisciplinary, forward-looking gold research council. Select the 2-6 most informative '
+                 'supported cross-market ticker keys for the next four separate 2-hour London-time XAUUSD forecasts. '
+                 'Use the current research theory; do NOT reflexively choose only GC/DXY. Include serious contradictory '
+                 'instruments that could falsify it, and prioritise the smallest necessary data basket. '
+                 'Return JSON with reason (string), additional_evidence (string about non-chart catalyst evidence), '
+                 'focus_interval (one of 5m/15m/1h, to match the main timing test), requests (array of objects: key as an exact catalog key, interval one of 5m/15m/1h/4h/1D, '
+                 'priority required/optional/context, reason string). XAUUSD target is included automatically. '
+                 'At least one other same-timeframe instrument must be required. '
+                 'Use 1D only for delayed TIPS/real yield/breakeven data and never portray it as live intraday yields. '
+                 'Use 5m/15m only if the proposed mechanism truly needs intraday event sequencing. '
+                 'Do not invent tickers, headlines, chart readings, price levels, flow records or probabilities. '
+                 'Uploaded CSVs are historical snapshots; no live market feed is connected.')
+    try:
+        answer=(chatgpt_auth.infer_json(instruction,payload) if chatgpt_auth.status().get('sharing')
+                else cloud_ai.infer_json(instruction,payload))
+        chosen=window_inputs.from_ai(answer,interdisciplinary.CATALOG,prior.get('source_plan_id'),WINDOW_FOCUS)
+        # Keep only the catalogue-validated request list; never persist unchecked AI metadata.
+        with DB_LOCK,conn() as c:
+            c.execute('INSERT INTO window_ticker_plans(id,source_plan_id,created,payload) VALUES (?,?,?,?)',
+                      (uuid.uuid4().hex[:18],prior.get('source_plan_id') or 'none',utc_now(),
+                       json.dumps(chosen,ensure_ascii=False)))
+        return _window_requirements()
+    except (ValueError,TypeError) as ex:
+        raise HTTPException(422,'Ticker request was not valid: '+str(ex)[:160])
+    except Exception as ex:
+        raise HTTPException(502,'AI ticker selection failed: '+str(ex)[:160])
+
+
+def _window_facts(now,requirements=None):
+    current=_council_current()
+    plan=current.get('plan') or {}
+    bias=_load_bias(WINDOW_FOCUS,'intraday') or {}
     prior=plan.get('research_cycle') or {}
+    selected=requirements or _window_requirements(now)
     observations=[]
-    for c in recent_charts(max_rows=20):
-        if c.get('symbol') in (WINDOW_FOCUS,'TVC:DXY','COMEX:GC1!','FRED:DFII10'):
-            observations.append({k:c.get(k) for k in ('symbol','interval','last_time','latest_close',
-                        'twenty_bar_percent','one_bar_percent','uploaded_at','cautions')})
+    for r in selected['requests']:
+        if r.get('snapshot'):
+            observations.append({**r['snapshot'],'priority':r['priority'],'data_status':r['status'],
+                                 'reason_for_request':r['reason']})
     items=[e for e in list_events('live')+list_events('manual') if parse_date(e.get('time'))<=now]
     items.sort(key=lambda e:e.get('time',''),reverse=True)
     return {'as_of_utc':window_forecasts.iso(now),'focus':WINDOW_FOCUS,
       'held_fundamental_bias':{k:bias.get(k) for k in ('direction','state','basis','reason','ai_rationale')},
       'research_mandate':str(plan.get('question') or '')[:900],
       'current_ai_priority':{k:prior.get(k) for k in ('leading_title','leading_direction','leading_reason','theories')},
-      'market_snapshots':observations[:8],
+      'ticker_selection_source':selected['source'],
+      'requested_inputs':[{k:r.get(k) for k in ('symbol','interval','priority','reason','status','last_time','bars')}
+                          for r in selected['requests']],
+      'required_input_coverage':selected['summary'],
+      'market_snapshots':observations,
       'dated_evidence':[{'title':e.get('title'),'time':e.get('time'),'source':e.get('source'),
           'source_kind':e.get('source_kind')} for e in items[:10]],
-      'limitations':'Market snapshots are manually uploaded and potentially stale. '
-          'No independent continuous market feed. Headline metadata is not proof.'}
+      'limitations':'Only matching, user-uploaded CSV snapshots are included. Missing/stale CSVs are explicitly '
+        'labelled. No independent continuous market feed. Headline metadata is not proof.'}
 
 
-def _window_generation(day=None,now=None):
+def _window_generation(day=None,now=None,allow_partial=False):
     """Generate future-only predictions. Repeated calls never replace a locked forecast."""
     now=now or dt.datetime.now(UTC)
     target=window_forecasts.validate_date(day,now)
@@ -834,7 +913,13 @@ def _window_generation(day=None,now=None):
         if not slots:raise ValueError('No eligible future windows remain on this date. Existing forecasts are locked.')
         if not cloud_ai.configured() and not chatgpt_auth.status().get('sharing'):
             raise ValueError('An OpenAI connection is required to generate council forecasts.')
-        context=_window_facts(now)
+        requirements=_window_requirements(now)
+        missing=[r['symbol']+' '+r['interval']+' ('+r['status']+')' for r in requirements['requests']
+                 if r['priority']=='required' and r['status']!='ready']
+        if missing and not allow_partial:
+            raise ValueError('Required CSV inputs not ready: '+', '.join(missing)+
+                             '. Upload the requested CSVs or explicitly choose forecast with partial data.')
+        context=_window_facts(now,requirements)
         instructions=('You are a forward-looking interdisciplinary gold research council. Forecast EACH supplied two-hour '
           'London-time window on its own merits; do not simply copy the held macro bias. '
           'Give a Bullish, Bearish, Flat, or Abstain forecast for each. '
@@ -843,7 +928,7 @@ def _window_generation(day=None,now=None):
           'These thresholds are fixed by a separate deterministic auditor. '
           'Assess plausible price and catalyst timing, competing explanations, liquidity and sessions, '
           'but never fabricate live prices, current news or verified market flows. '
-          'A stale input is stale, and an unverified thesis stays unverified. '
+          'Use the dynamic requested_inputs basket, and weigh each uploaded snapshot only to the extent its ''ticker/timeframe and as-of timestamp warrant. Missing/stale inputs must lower conviction. ''A stale input is stale, and an unverified thesis stays unverified. '
           'You can predict a bearish window while the macro bias is bullish. '
           'Choose Abstain when no non-arbitrary directional or flat expectation can be defended. '
           'Do not claim calibrated probabilities. Return ONLY a JSON object with forecasts array, '
@@ -862,6 +947,10 @@ def _window_generation(day=None,now=None):
             locked=window_forecasts.lock_forecasts(c,target.isoformat(),WINDOW_FOCUS,slots,
                 predictions,{'held_bias_at_lock':context['held_fundamental_bias'],
                              'input_snapshot_as_of':context['as_of_utc'],
+                             'ticker_selection_source':context['ticker_selection_source'],
+                             'ticker_requests_at_lock':context['requested_inputs'],
+                             'required_coverage_at_lock':context['required_input_coverage'],
+                             'partial_data_acknowledged':bool(missing),
                              'research_mandate':context['research_mandate'],
                              'theory_at_lock':context['current_ai_priority'].get('leading_title'),
                              'snapshot_times':[{'symbol':v['symbol'],'last_time':v['last_time']} for v in context['market_snapshots']]},
@@ -870,7 +959,7 @@ def _window_generation(day=None,now=None):
 
 @app.post('/api/windows/forecast')
 def window_generate(body:WindowGenerateInput):
-    try:locked=_window_generation(body.date)
+    try:locked=_window_generation(body.date,allow_partial=body.allow_partial)
     except (ValueError,TypeError) as e:raise HTTPException(409,str(e))
     except Exception as e:raise HTTPException(502,'Window forecasting failed: '+str(e)[:150])
     return {'locked':locked,'count':len(locked),'immutable':True,'not_trade_signals':True}
@@ -886,6 +975,7 @@ def windows_today(date:str|None=None):
         board=window_forecasts.window_summary(forecasts,audits,target,now,WINDOW_FOCUS)
         board['auto_enabled']=get_setting('auto_window_forecasts')
         board['held_macro_bias']=_load_bias(WINDOW_FOCUS,'intraday')
+        board['requirements']=_window_requirements(now)
         return board
     except ValueError as e:raise HTTPException(422,str(e))
 
@@ -942,7 +1032,7 @@ def _automatic_window_tick():
         claimed=c.execute('INSERT OR IGNORE INTO window_auto_attempts(trading_date,attempted_at,result) VALUES(?,?,?)',
                 (day,utc_now(),'attempted')).rowcount
     if not claimed:return
-    try:_window_generation(day,now)
+    try:_window_generation(day,now,allow_partial=True)
     except Exception as ex:
         # Do not retry endlessly and incur multiple charges; manual retry remains available.
         with DB_LOCK,conn() as c:

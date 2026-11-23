@@ -89,7 +89,7 @@
 <body><div id="root"></div><script>
 const ICON={overview:'◫',stream:'≋',connections:'⌁',replay:'◷',sources:'◎',research:'◉',macro:'▤',news:'≋',geopolitics:'◎',logistics:'♧',market:'⌁',positioning:'◉',research:'⊕'};
 let s={mode:'live',page:'overview',data:null,selected:null,filter:'all',query:'',replay:null,modal:null,connection:null,busy:false,research:null,researchQuestion:'',council:null,windows:null,windowPerformance:null,windowDate:null};
-const stagedUploads={chart:null,council:{}};
+const stagedUploads={chart:null,council:{},window:{}};
 const $=x=>document.querySelector(x),esc=x=>String(x??'').replace(/[&<>"']/g,a=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[a]));
 const fmt=x=>{try{return new Date(x).toLocaleString('en-GB',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit',timeZone:'UTC',hour12:false})+' UTC'}catch{return x}};
 const api=async (route,method='GET',body)=>{const r=await fetch(route,{method,headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const d=await r.json();if(!r.ok)throw Error(d.detail||('HTTP '+r.status));return d};
@@ -180,6 +180,7 @@ function windowPage(){
        <div class="hint">London time · ${esc(fmt(w.opens_at))} to ${esc(fmt(w.closes_at))}</div>
        ${f?`<div class="window-dir ${v.direction==='Bullish'?'window-bull':v.direction==='Bearish'?'window-bear':''}">${esc(v.direction)} <small>· ${esc(v.conviction)}</small></div>
        <p>${esc(v.rationale)}</p><p class="hint"><b>Leading theory:</b> ${esc(v.leading_theory||'Not specified')}</p><p class="hint"><b>Catalyst:</b> ${esc(v.catalyst||'Not specified')}</p><p class="hint"><b>Invalidation:</b> ${esc(v.invalidation||'Not specified')}</p>
+       <p class="hint">Input basket at lock: ${esc(f.context?.ticker_selection_source||'v0.8 fixed inputs')} · ${esc(f.context?.required_coverage_at_lock?.required_ready??'—')} required ready · ${f.context?.partial_data_acknowledged?'PARTIAL DATA':''}</p>
        <p class="hint">Locked ${esc(fmt(f.published_at))} · SHA-256 ${esc((f.digest_sha256||'').slice(0,14))}…</p>`:`<p class="hint">${esc(w.state)}. No forecast can be backdated or created after this window opens.</p>`}
        ${a?`<div class="window-outcome"><strong>${windowBadge(a.grade)} ${Number(a.return_percent)>=0?'+':''}${esc(a.return_percent)}% observed</strong><div class="hint">Open ${esc(a.open_price)} → Close ${esc(a.close_price)} · ${esc(a.candle_interval)} · ${esc(a.source_file||'CSV')}</div></div>`:
        f?`<div class="window-outcome hint">${esc(w.state)}. Import a complete OANDA:XAUUSD 1-hour or 5-minute CSV after the close to grade.</div>`:''}
@@ -189,11 +190,31 @@ function windowPage(){
   const hist=(p?.by_window||{});
   const perfrows=[1,2,3,4].map(i=>{const row=hist[String(i)]||{};return `<tr><td>${i} · ${esc(row.label||'')}</td><td>${esc(row.locked??0)}</td><td>${esc(row.wins??0)}</td><td>${esc(row.losses??0)}</td><td>${row.win_rate==null?'—':esc(row.win_rate)+'%'}</td></tr>`}).join('');
   const remaining=(b.windows||[]).filter(w=>!w.forecast && Date.parse(w.opens_at)>Date.now());
-  return heading('Four-window Forecast Auditor','Five distinct outputs: one persistent fundamental bias and four forward-locked, separately judged London-time forecasts.',false)+
+  const basket=b.requirements||{}, coverage=basket.summary||{};
+  const tickerRows=(basket.requests||[]).map(r=>{
+    const key=r.symbol+'|'+r.interval,selected=stagedUploads.window[key];
+    const statusLabel={ready:'READY',stale:'STALE',missing:'MISSING',insufficient:'TOO FEW BARS','invalid-time':'CHECK TIME'}[r.status]||r.status;
+    const statusStyle=r.status==='ready'?'ok':'warn';
+    return `<div class="council-req"><div><div class="req-symbol">${esc(r.symbol)}</div><div class="req-name">${esc(r.name||'')} · ${esc(r.interval)} · ${esc(r.priority)}</div></div>
+      <div class="req-status">${esc(r.reason)}${r.last_time?`<div style="margin-top:5px">Latest candle: ${esc(fmt(r.last_time))}</div>`:''}</div>
+      <span class="council-step ${statusStyle}">${esc(statusLabel)}</span>
+      <label class="field"><input class="file-picker" type="file" accept=".csv,text/csv" data-window-csv="${esc(key)}" aria-label="Choose ${esc(r.symbol)} ${esc(r.interval)} CSV"><span class="hint" data-upload-label="window-${esc(key)}">${selected?`Selected: ${esc(selected.name)}`:'Choose a CSV file'}</span></label>
+      <button class="button small" data-act="window-csv-import" data-symbol="${esc(r.symbol)}" data-interval="${esc(r.interval)}" ${s.busy?'disabled':''}>↑ Import</button></div>`;
+  }).join('');
+  const tickerPanel=`<div class="panel" style="padding:20px 22px;margin-bottom:18px"><div class="eyebrow">DYNAMIC TICKER BASKET · AI THEORY → PRICE EVIDENCE</div>
+    <h2 style="margin:8px 0">Which chart CSVs should inform the four forecasts?</h2>
+    <p class="hint">Source: ${esc(basket.source||'not available')} · ${esc(basket.reason||'')} The Research Studio's latest XAUUSD plan supplies the initial basket. You can separately ask AI to revise it as competing hypotheses develop.</p>
+    <div style="display:flex;gap:9px;flex-wrap:wrap;margin:13px 0"><span class="council-step ${coverage.required_not_ready?'warn':'ok'}">${esc(coverage.required_ready??0)} / ${esc(coverage.required_total??0)} required ready</span><span class="council-step">${esc(coverage.stale??0)} stale</span><span class="council-step">${esc(coverage.missing??0)} missing</span></div>
+    ${tickerRows||'<p class="hint">Start Research Studio to discover and request instrument evidence.</p>'}
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:15px"><button class="button" data-act="window-refresh-tickers" ${s.busy?'disabled':''}>✧ Ask AI to update ticker requests</button><button class="button small" data-nav="council">Open Research Studio</button></div>
+    <p class="hint" style="margin-top:12px">AI ticker selection is a separate paid API action. Upload matching TradingView tickers and intervals, ideally 100+ completed candles. The four-window council uses only these selected market snapshots, with stale or missing data explicitly marked. If required CSVs are missing, you may explicitly choose a provisional forecast; the missing inputs are locked into its audit record. No live market data are fetched.</p>
+  </div>`;
+  return heading('Four-window Forecast Auditor','Dynamic Research Studio tickers inform four separately locked, independently judged London-time forecasts.',false)+
     `<div class="panel window-toolbar"><div><div class="eyebrow">FORECAST DATE · EUROPE/LONDON</div><input type="date" id="window-date" value="${esc(b.trading_date)}" aria-label="Choose forecast date"></div>
      <div class="window-actions"><button class="button primary" data-act="window-forecast" ${!remaining.length||s.busy?'disabled':''}>✧ Generate & lock ${remaining.length} future window${remaining.length===1?'':'s'}</button>
      <button class="button" data-act="window-audit">↻ Audit imported prices</button><button class="button" data-nav="charts">↑ Import XAUUSD CSV</button></div></div>
      <div class="panel" style="padding:16px 20px;margin-bottom:17px"><div class="eyebrow">PERSISTENT FUNDAMENTAL THESIS · SEPARATE FROM THE WINDOW CALLS</div><strong>${esc(macro.direction||'Unestablished')} · ${esc(macro.state||'Unestablished')}</strong><p class="hint">${esc(macro.reason||'Run the Research Studio first to develop a held thesis. Each intraday window can disagree with it.')}</p></div>
+     ${tickerPanel}
      <div class="window-metrics"><div class="panel metric"><div class="metric-label">Locked today</div><strong>${stats.locked||0}<em> / 4</em></strong></div><div class="panel metric"><div class="metric-label">Wins / Losses</div><strong>${stats.wins||0} <em>/</em> ${stats.losses||0}</strong></div><div class="panel metric"><div class="metric-label">Neutral / Abstained</div><strong>${stats.neutral||0} <em>/</em> ${stats.abstentions||0}</strong></div><div class="panel metric"><div class="metric-label">Graded accuracy</div><strong>${rate==null?'—':rate+'%'}</strong><em>${stats.scored_denominator||0} scored wins/losses</em></div></div>
      <div class="window-grid">${fore}</div>
      <div class="panel" style="padding:20px 22px;margin-top:20px"><div class="eyebrow">OPTIONAL PAID AUTOPILOT</div><h2 style="margin:7px 0 8px">Generate the next four window forecasts automatically</h2><label class="window-toggle"><input type="checkbox" id="window-auto" ${b.auto_enabled?'checked':''}/> Enable weekday AI forecasts at 00:30 London time</label>
@@ -225,8 +246,31 @@ async function act(a,el){if(s.busy&&a!=='close')return;
 try{if(a==='window-forecast'){
   if(!confirm('Lock every remaining future window forecast? These AI calls are billed separately and cannot be edited afterward.'))return;
   try{s.busy=true;notify('Generating and timestamp-locking the eligible window forecasts…');
-    const res=await api('/api/windows/forecast','POST',{date:s.windowDate});
+    const unready=s.windows?.requirements?.summary?.required_not_ready||0;
+    const allowPartial=unready>0;
+    if(allowPartial&&!confirm(unready+' required ticker CSV(s) are missing, stale or incomplete. Lock provisional window forecasts with partial evidence anyway? The missing inputs will be recorded.'))return;
+    const res=await api('/api/windows/forecast','POST',{date:s.windowDate,allow_partial:allowPartial});
     await refreshWindowDashboard();render();notify('Locked '+res.count+' future windows before they start.');
+  }catch(err){notify(err.message)}finally{s.busy=false}return;
+}
+if(a==='window-refresh-tickers'){
+  if(!confirm('Ask OpenAI to select a new theory-specific ticker basket? This makes a separately billed API call.'))return;
+  try{s.busy=true;notify('AI is selecting the most informative cross-market tickers and intervals…');
+    await api('/api/windows/requirements/refresh','POST',{});
+    await refreshWindowDashboard();render();notify('Ticker requests updated. Upload required CSVs to strengthen the four-window forecast.');
+  }catch(err){notify(err.message)}finally{s.busy=false}return;
+}
+if(a==='window-csv-import'){
+  const symbol=el.dataset.symbol,interval=el.dataset.interval,key=symbol+'|'+interval;
+  const input=[...document.querySelectorAll('[data-window-csv]')].find(x=>x.dataset.windowCsv===key);
+  const file=stagedUploads.window[key]||input?.files?.[0];
+  if(!file){notify('Select the '+symbol+' '+interval+' CSV first.');return}
+  try{s.busy=true;notify('Validating '+symbol+' '+interval+' CSV…');
+    const response=await fetch('/api/chart/import?symbol='+encodeURIComponent(symbol)+'&interval='+encodeURIComponent(interval),
+      {method:'POST',headers:{'Content-Type':'text/csv','X-Filename':file.name},body:file});
+    const result=await response.json();if(!response.ok)throw Error(result.detail||'Import failed');
+    delete stagedUploads.window[key];await refreshWindowDashboard();render();
+    notify('Imported '+result.bars+' candles for '+symbol+' '+interval+'.');
   }catch(err){notify(err.message)}finally{s.busy=false}return;
 }
 if(a==='window-audit'){
@@ -262,6 +306,8 @@ if(a==='export'){let blob=new Blob([JSON.stringify({mode:s.mode,exported_at:new 
 }catch(e){notify(e.message)}finally{s.busy=false}}
 document.addEventListener('click',async e=>{let t=e.target.closest('[data-nav],[data-mode],[data-event],[data-filter],[data-act],[data-connection],[data-which]');if(!t){if(e.target.dataset.cover)closeModal();return}if(t.dataset.nav){s.page=t.dataset.nav;s.replay=null;if(s.page==='windows'){try{await refreshWindowDashboard()}catch(err){notify(err.message)}}render();window.scrollTo(0,0)}else if(t.dataset.mode){s.mode=t.dataset.mode;s.selected=null;s.replay=null;s.filter='all';s.query='';await load()}else if(t.dataset.event){s.selected=t.dataset.event;render()}else if(t.dataset.filter){s.filter=t.dataset.filter;render()}else if(t.dataset.connection){s.connection=t.dataset.connection;render()}else if(t.dataset.which){let n=s.data.state.narratives.find(x=>x.id===t.dataset.which);notify(n.name+': '+n.tests.join(' · '))}else if(t.dataset.act){await act(t.dataset.act,t)}});
 document.addEventListener('change',async e=>{
+if(e.target.matches('[data-window-csv]')){const key=e.target.dataset.windowCsv,f=e.target.files?.[0];
+ if(f){stagedUploads.window[key]=f;const label=e.target.parentElement?.querySelector('[data-upload-label]');if(label)label.textContent='Selected: '+f.name;}}
 if(e.target.matches('[data-csv]')){const k=e.target.dataset.csv;const f=e.target.files?.[0];if(f){stagedUploads.council[k]=f;const label=e.target.parentElement?.querySelector('[data-upload-label]');if(label)label.textContent='Selected: '+f.name}};
 if(e.target.matches('input[name=csv]')){const f=e.target.files?.[0];if(f){stagedUploads.chart=f;const label=e.target.parentElement?.querySelector('[data-upload-label]');if(label)label.textContent='Selected: '+f.name}};
 if(e.target.id==='window-date'){s.windowDate=e.target.value;try{await refreshWindowDashboard();render()}catch(err){notify(err.message)}return}
